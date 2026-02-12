@@ -3,7 +3,7 @@
 Module for processing waveform files stored in a data archive.
 
 :copyright:
-    2020–2026, QuakeMigrate developers.
+    2020–2023, QuakeMigrate developers.
 :license:
     GNU General Public License, Version 3
     (https://www.gnu.org/licenses/gpl-3.0.html)
@@ -17,6 +17,7 @@ import pathlib
 from obspy import read, Stream, UTCDateTime
 
 import quakemigrate.util as util
+from quakemigrate.io.dasio.das import read_das
 
 
 class Archive:
@@ -89,15 +90,79 @@ class Archive:
         midnight), whether to interpolate the data to apply the necessary correction.
         Default behaviour is to just alter the metadata, resulting in a sub-sample
         timing offset. See :func:`~quakemigrate.util.shift_to_sample`.
-    ignore_network_code : bool, optional
-        If True, replace all network codes in the waveform archive with a dummy value.
-        Note this may cause issues if station codes are repeated, with SEED-ID's only
-        distinguished by their differing network codes.
-    dummy_network_code : str, optional
-        Provides the option to specify the dummy network code applied to the waveform
-        archive, if `ignore_network_code` is set to True.
-    ignore_location_code : bool, optional
-        If True, replace all location codes in the waveform archive with a blank string.
+    
+    DAS Specific Attributes
+    -----------------------
+    das_archive_path : `pathlib.Path` object, optional
+        If das data is also to be included in analysis, ths is the path to the das data 
+        archive. This currently has to be of a somewhat specific format, where all das 
+        files are in the same directory and are labelled by time. Currently, only files 
+        with start time in the format: *UTC_YYYYMMDD_HHMMSS.???.<das_data_fmt> 
+        are supported. <das_data_fmt> is specified as another attribute of Archive. 
+        Default is das_archive_path = None, resulting in no das data being included in 
+        the analysis.
+    das_data_fmt : str
+        If das data is included (i.e. if <das_archive_path> is specified), then this is 
+        the das format to be read. Currently, the only supported formats are h5 and sgy, 
+        but it is relatively trivial to support other formats in the future (contact the 
+        developers or fork repository). Default is h5.
+    first_last_das_channels : list of 2x ints, optional
+        If specified, selects only certain DAS channels along the fibre, from 
+        first_last_das_channels[0] to first_last_das_channels[1]. Default is to use 
+        all channels.
+    duplicate_das_comps : bool, optional
+        Controls whether Z, N and E for single-component das data are all set to be 
+        eqaul to each other (True) or whether only one component is passed (N).
+    station_prefix : str, optional
+        Station name prefix for das channels. das channels are then named with the 
+        station prefix followed by an integer representing the distance along the fibre.
+        Default is "D".
+    spatial_down_samp_factor : int, optional
+        If specified, will downsample das data spatially by the factor. 
+    fk_filter_params : dict, optional
+        If specified, will apply an fk filter to the data. Applied here as most efficient 
+        to do it before the 2D data is split.
+        keys are: "wavenumber", "max_freq" and "v_app_filts". First two are floats, 
+        corresponding to the max. wavenumber and max. freq. to pass, respectively, 
+        and v_app_filts is None or a list of floats, corresponding to specific apparent 
+        velocities to remove (e.g. due to continuous noise from a single source). If in 
+        doubt, set fk_filter_params["v_app_filts"] = None.
+        Default is to not apply a fk filter.
+    apply_notch_filter : bool, optional
+        If True, applies a notch filter, typically applied to remove generator noise. 
+        Default is False. If specified, should also specify notch_freqs (=[]) and  
+        notch_bw (=2.5).
+    semblance_stack : bool, optional
+        If True and das data is to be spatially downsampled, then will downsample das data, 
+        but stacking using semblance based stacking. Default is not to perform semblance 
+        stacking, as not particularly computationally efficient.
+    semblance_v_app_min : float, optional
+        Only used if semblance_stack=True. This is the minimum apparent velocity to be expected 
+        for a plane wave arriving at the fibre, in units of km/s. Typically, one might set this 
+        to the minimum S-wave velocity expected. Default is 1 km/s.
+    convert_strainrate_to_vel : bool, optional
+        If True, will convert das strain-rate data to velocity. Note, that if strain data is 
+        passed, then will instead convert to displacement. Default is False.
+    strain_vs_strainrate : str
+        Specify whether native das data is in strain-rate or strain. 
+        Default is <strain_vs_strainrate>=strainrate. Other option is 
+        <strain_vs_strainrate>=strain.
+    channel_spacing : float, optional
+        Used if data format is SEGY (das_data_fmt = sgy). Channel spacing of DAS data in metres.
+        Default is None. Must be specified if data format is SEGY.
+    gauge_length : float, optional
+        Used if data format is SEGY (das_data_fmt = sgy). Gauge length of DAS data in metres.
+        Default is None. Must be specified if data format is SEGY.
+    linfibreapprox : bool
+        If True, applies a cummulative integration, which performs better for 
+        linear fibre geometries. Otherwise, will apply a simpler integration 
+        technique. Default is False.
+    bespoke_das_h5_func : python func, optional
+        If specified, will use this function to read in the DAS data instead of the default.
+        Must use das_data_fmt=h5, although technically the data can be any format as long 
+        as the function can read it and output <data>, <headers>, <axis> information. For 
+        structure of these, see quakemigrate.io.dasio.load_das_h5.load_file function.
+        Default is None, i.e. it is not used.
 
     Methods
     -------
@@ -124,10 +189,6 @@ class Archive:
         self.resample = kwargs.get("resample", False)
         self.upfactor = kwargs.get("upfactor")
         self.interpolate = kwargs.get("interpolate", False)
-        # SEED ID params
-        self.ignore_network_code = kwargs.get("ignore_network_code", False)
-        self.dummy_network_code = kwargs.get("dummy_network_code", "XX")
-        self.ignore_location_code = kwargs.get("ignore_location_code", False)
         # Response removal parameters
         self.response_inv = kwargs.get("response_inv")
         response_removal_params = kwargs.get("response_removal_params", {})
@@ -141,6 +202,29 @@ class Archive:
         self.remove_full_response = response_removal_params.get(
             "remove_full_response", False
         )
+        # DAS data read parameters:
+        #modified to read multiple DAS wells
+        self.das_archive_path = kwargs.get("das_archive_path", None)
+        if self.das_archive_path:
+            self.das_archive_path = pathlib.Path(self.das_archive_path)
+        self.das_data_fmt = kwargs.get("das_data_fmt", "h5")
+        self.num_wells = kwargs.get("num_wells", 1)
+        self.first_last_das_channels = kwargs.get("first_last_das_channels", [[0,-1]])
+        self.duplicate_das_comps = kwargs.get("duplicate_das_comps", True)
+        self.station_prefix = kwargs.get("station_prefix", ["D"])
+        self.spatial_down_samp_factor = kwargs.get("spatial_down_samp_factor", [1])
+        self.fk_filter_params = kwargs.get("fk_filter_params", {})
+        self.apply_notch_filter = kwargs.get("apply_notch_filter", False)
+        self.notch_freqs = kwargs.get("notch_freqs", [])
+        self.notch_bw = kwargs.get("notch_bw", 2.5)
+        self.semblance_stack = kwargs.get("semblance_stack", False)
+        self.semblance_v_app_min = kwargs.get("semblance_v_app_min", 1.0)
+        self.convert_strainrate_to_vel = kwargs.get("convert_strainrate_to_vel", False)
+        self.strain_vs_strainrate = kwargs.get("strain_vs_strainrate", "strainrate")
+        self.channel_spacing = kwargs.get("channel_spacing", [0.2, 0.2])
+        self.gauge_length = kwargs.get("gauge_length", [10,10])
+        self.linfibreapprox = kwargs.get("linfibreapprox", False)
+        self.bespoke_das_h5_func = kwargs.get("bespoke_das_h5_func", None)
 
     def __str__(self, response_only=False):
         """
@@ -272,6 +356,7 @@ class Archive:
         # Ensure pre-pad and post-pad are not negative.
         pre_pad = max(0.0, pre_pad)
         post_pad = max(0.0, post_pad)
+        print('pre_pad: '+str(pre_pad)+', post_pad:'+str(post_pad))
 
         data = WaveformData(
             starttime=starttime,
@@ -290,8 +375,10 @@ class Archive:
 
         files = self._load_from_path(starttime - pre_pad, endtime + post_pad)
 
+        # Read in data:
         st = Stream()
         try:
+            # Read in conventional seismometer data:
             first = next(files)
             files = chain([first], files)
             for file in files:
@@ -308,55 +395,79 @@ class Archive:
                 except TypeError:
                     logging.info(f"File not compatible with ObsPy - {file}")
                     continue
-
-            # If network code is to be ignored, set all channels to network code 'XX'
-            if self.ignore_network_code:
-                for tr in st:
-                    tr.stats.network = self.dummy_network_code
-
-            # If location code is to be ignored, set all channels to location code ''
-            if self.ignore_location_code:
-                for tr in st:
-                    tr.stats.location = ""
-
-            # Merge waveforms channel-by-channel with no-clobber merge
-            st = util.merge_stream(st)
-
-            # Make copy of raw waveforms to output if requested
-            data.raw_waveforms = st.copy()
-
-            # Ensure data is timestamped "on-sample" (i.e. an integer number of samples
-            # after midnight). Otherwise the data will be implicitly shifted when it is
-            # used to calculate the onset function / migrated.
-            st = util.shift_to_sample(st, interpolate=self.interpolate)
-
-            if self.read_all_stations:
-                # Re-populate st with only stations in station file
-                st_selected = Stream()
-                for station in self.stations:
-                    st_selected += st.select(station=station)
-                st = st_selected.copy()
-                del st_selected
-
-            if pre_pad != 0.0 or post_pad != 0.0:
-                # Trim data between start and end time
-                for tr in st:
-                    tr.trim(starttime=starttime, endtime=endtime, nearest_sample=True)
-                    if not bool(tr):
-                        st.remove(tr)
-
-            # Test if the stream is completely empty
-            # (see __nonzero__ for `obspy.Stream` object)
-            if not bool(st):
-                raise util.DataGapException
-
-            # Add cleaned stream to `waveforms`
-            data.waveforms = st
-
         except StopIteration:
-            raise util.ArchiveEmptyException
+            if not self.das_archive_path:
+                raise util.ArchiveEmptyException
+
+        # Read in das data (if available):
+        print('starttime in read waveform: '+str(starttime))
+        print('endtime in read waveform: '+str(endtime))
+        if self.das_archive_path:
+            print(self.spatial_down_samp_factor[0])
+            for i in range(self.num_wells):
+                print('on well '+str(i)+' out of '+str(self.num_wells))
+                try:
+                    st += read_das(self.das_archive_path, self.das_data_fmt, starttime, 
+                            endtime, pre_pad=pre_pad, post_pad=post_pad, 
+                            first_last_das_channels=self.first_last_das_channels[i],
+                            duplicate_das_comps=self.duplicate_das_comps,
+                            station_prefix=self.station_prefix[i], 
+                            spatial_down_samp_factor=self.spatial_down_samp_factor[i],
+                            fk_filter_params=self.fk_filter_params, 
+                            apply_notch_filter=self.apply_notch_filter, 
+                            notch_freqs=self.notch_freqs, notch_bw=self.notch_bw, 
+                            semblance_stack=self.semblance_stack, 
+                            semblance_v_app_min=self.semblance_v_app_min,
+                            convert_strainrate_to_vel=self.convert_strainrate_to_vel,
+                            strain_vs_strainrate=self.strain_vs_strainrate,
+                            channel_spacing=self.channel_spacing[i],
+                            gauge_length=self.gauge_length[i],
+                            linfibreapprox=self.linfibreapprox, 
+                            bespoke_das_h5_func=self.bespoke_das_h5_func)
+                except ValueError:
+                # Raise error if no data exists:
+                    if len(st) == 0:
+                        print("Warning: No standard or DAS data exists or can be read.")
+                        raise util.DASArchiveEmptyException
+                    else:
+                        print("Warning: DAS data archive either doesn't contain data for the specified time period, or is of an unsupported format for reading. Continuing with standard data only.")
+
+        # Merge waveforms channel-by-channel with no-clobber merge
+        st = util.merge_stream(st)
+
+        # Make copy of raw waveforms to output if requested
+        data.raw_waveforms = st.copy()
+
+        # Ensure data is timestamped "on-sample" (i.e. an integer number of samples
+        # after midnight). Otherwise the data will be implicitly shifted when it is
+        # used to calculate the onset function / migrated.
+        st = util.shift_to_sample(st, interpolate=self.interpolate)
+
+        if self.read_all_stations:
+            # Re-populate st with only stations in station file
+            st_selected = Stream()
+            for station in self.stations:
+                st_selected += st.select(station=station)
+            st = st_selected.copy()
+            del st_selected
+
+        if pre_pad != 0.0 or post_pad != 0.0:
+            # Trim data between start and end time
+            for tr in st:
+                tr.trim(starttime=starttime, endtime=endtime, nearest_sample=True)
+                if not bool(tr):
+                    st.remove(tr)
+        
+        # Test if the stream is completely empty
+        # (see __nonzero__ for `obspy.Stream` object)
+        if not bool(st):
+            raise util.DataGapException
+
+        # Add cleaned stream to `waveforms`
+        data.waveforms = st
 
         return data
+
 
     def _load_from_path(self, starttime, endtime):
         """
@@ -387,8 +498,8 @@ class Archive:
         # Loop through time period by day adding files to list
         # NOTE! This assumes the archive structure is split into days.
         files = []
-        loadstart = UTCDateTime(starttime.date)
-        while loadstart <= endtime:
+        loadstart = UTCDateTime(starttime)
+        while loadstart < endtime:
             temp_format = self.format.format(
                 year=loadstart.year,
                 month=loadstart.month,
@@ -405,30 +516,9 @@ class Archive:
                 for station in self.stations:
                     file_format = temp_format.format(station=station)
                     files = chain(files, self.archive_path.glob(file_format))
-            loadstart += 86400
+            loadstart = UTCDateTime(loadstart.date) + 86400
 
         return files
-
-    @property
-    def dummy_network_code(self):
-        """
-        Dummy network code is a 2 character string to replace the (possibly mixed) network
-        codes in the input archive.
-
-        """
-
-        return self._dummy_network_code
-
-    @dummy_network_code.setter
-    def dummy_network_code(self, value):
-        """Setter for dummy network code."""
-
-        if isinstance(value, str) and len(value) == 2:
-            self._dummy_network_code = value
-        else:
-            raise ValueError(
-                f"`dummy_network_code` must be a 2 character string, not {value}."
-            )
 
 
 class WaveformData:
@@ -648,14 +738,10 @@ class WaveformData:
                 # rate as provided. To check that as well, use
                 # `check_sampling_rate=True` and specify a sampling rate.
                 if full_timespan:
-                    n_samples = int(round(timespan * st_id[0].stats.sampling_rate + 1))
+                    n_samples = round(timespan * st_id[0].stats.sampling_rate + 1)
                     if len(st_id) > 1:
                         continue
                     elif st_id[0].stats.npts < n_samples:
-                        logging.debug("Trace has too few samples.")
-                        logging.debug(
-                            f"(n_samples, trace_npts) : ({n_samples}, {st_id[0].stats.npts})"
-                        )
                         continue
                 # Check start and end times of trace are exactly correct
                 if check_start_end_times:
